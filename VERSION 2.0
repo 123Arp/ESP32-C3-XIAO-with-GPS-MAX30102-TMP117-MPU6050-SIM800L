@@ -1,0 +1,480 @@
+#define TINY_GSM_MODEM_SIM800
+#include <TinyGsmClient.h>
+#include <SoftwareSerial.h>
+#include <Wire.h>
+#include <TinyGPSPlus.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_TMP117.h>
+#include <MAX30105.h>
+#include "heartRate.h"
+#include "spo2_algorithm.h"
+#include <PubSubClient.h>
+
+// SIM800L GPRS Setup
+#define SIM800L_SERIAL Serial1
+#define SIM800L_RX_PIN 20
+#define SIM800L_TX_PIN 21
+const char apn[] = "airtelgprs.com";
+const char gprsUser[] = "";
+const char gprsPass[] = "";
+TinyGsm modem(SIM800L_SERIAL);
+TinyGsmClient gsmClient(modem); // Non-SSL client
+PubSubClient mqtt(gsmClient);
+
+// MQTT Settings
+const char* MQTT_SERVER = "io.adafruit.com";
+const int MQTT_PORT = 1883; // Non-SSL port
+const char* MQTT_USER = "Arpit_Esiitm";
+const char* MQTT_PASS = "aio_xryG59T0nsuuMLaqjujnInBunfaZ";
+const char* MQTT_CLIENT_ID = "esp32-c3-xiao-board-123456"; // Unique ID
+const char* sensor_topic = "Arpit_Esiitm/feeds/temp-data";
+const char* gps_topic = "Arpit_Esiitm/feeds/gps-data";
+const char* mpu6050_topic = "Arpit_Esiitm/feeds/mpu-data";
+const char* max30102_topic = "Arpit_Esiitm/feeds/max-data";
+const char* throttle_topic = "Arpit_Esiitm/throttle"; // Throttle topic for rate-limiting
+
+// GPS Setup - Using SoftwareSerial
+#define GPS_RX_PIN D2  // GPS TX -> ESP32 RX (D2)
+#define GPS_TX_PIN D3  // GPS RX -> ESP32 TX (D3)
+SoftwareSerial gpsSerial(GPS_RX_PIN, GPS_TX_PIN);
+TinyGPSPlus gps;
+
+// Sensor objects
+Adafruit_MPU6050 mpu;
+Adafruit_TMP117 tmp117;
+MAX30105 particleSensor;
+
+// Variables for sensor data
+float temperature = 0;
+float accelerationX = 0, accelerationY = 0, accelerationZ = 0;
+float gyroX = 0, gyroY = 0, gyroZ = 0;
+
+// MAX30102 variables
+const byte RATE_SIZE = 4;
+byte rates[RATE_SIZE];
+byte rateSpot = 0;
+long lastBeat = 0;
+float beatsPerMinute;
+int beatAvg;
+
+// SpO2 variables
+#define MAX_BRIGHTNESS 255
+#define SAMPLING_RATE 100 // Samples per second
+#define BUFFER_SIZE 100   // Buffer length
+uint32_t irBuffer[BUFFER_SIZE];  // Infrared LED sensor data
+uint32_t redBuffer[BUFFER_SIZE]; // Red LED sensor data
+int32_t bufferLength; // Data length
+int32_t spo2;         // SPO2 value
+int8_t validSPO2;     // Indicator to show if the SPO2 calculation is valid
+int32_t heartRate;    // Heart rate value
+int8_t validHeartRate; // Indicator to show if the heart rate calculation is valid
+
+// Finger detection
+long lastSeen = 0;
+bool fingerDetected = false;
+
+// GPRS and MQTT connection status
+bool gprsConnected = false;
+
+// Timing
+const unsigned long TIME_PERIOD = 3000;  // 3 seconds between sends
+unsigned long lastSend = 0;
+unsigned long lastGprsCheck = 0;
+unsigned long lastMqttCheck = 0;
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String message;
+  for (unsigned int i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
+  Serial.print("Message on topic ");
+  Serial.print(topic);
+  Serial.print(": ");
+  Serial.println(message);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  // Initialize GPS
+  Serial.println("Initializing GPS...");
+  gpsSerial.begin(9600);
+  
+  // Initialize SIM800L
+  Serial.println("Initializing SIM800L...");
+  SIM800L_SERIAL.begin(9600, SERIAL_8N1, SIM800L_RX_PIN, SIM800L_TX_PIN);
+  delay(5000);
+
+  Serial.println("BN-220 GPS TinyGPSPlus parsing...");
+  
+  // Initialize I2C
+  Wire.begin();
+  
+  // Initialize MPU6050
+  if (!mpu.begin()) {
+    Serial.println("Failed to find MPU6050 chip");
+  } else {
+    Serial.println("MPU6050 Found!");
+    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_5_HZ);
+  }
+  
+  // Initialize TMP117
+  if (!tmp117.begin()) {
+    Serial.println("Failed to find TMP117 chip");
+  } else {
+    Serial.println("TMP117 Found!");
+  }
+  
+  // Initialize MAX30102
+  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println("MAX30102 was not found. Please check wiring/power.");
+  } else {
+    Serial.println("MAX30102 Found!");
+    byte ledBrightness = 60;
+    byte sampleAverage = 4;
+    byte ledMode = 2;
+    int sampleRate = 100;
+    int pulseWidth = 411;
+    int adcRange = 4096;
+    
+    particleSensor.setup(ledBrightness, sampleAverage, ledMode, sampleRate, pulseWidth, adcRange);
+    particleSensor.setPulseAmplitudeRed(0x0A);
+    particleSensor.setPulseAmplitudeGreen(0);
+  }
+  
+  // Pre-fill the buffers
+  for (int i = 0; i < BUFFER_SIZE; i++) {
+    irBuffer[i] = 0;
+    redBuffer[i] = 0;
+  }
+
+  // Setup GPRS connection
+  setupGPRS();
+
+  // Setup MQTT
+  mqtt.setServer(MQTT_SERVER, MQTT_PORT);
+  mqtt.setCallback(mqttCallback);
+  connectMqttWithRetry();
+}
+
+void setupGPRS() {
+  // Test modem response
+  Serial.println("Testing modem response...");
+  if (!modem.testAT()) {
+    Serial.println("Modem not responding! Check wiring and power.");
+    return;
+  }
+  Serial.println("Modem is responding.");
+
+  // Disable command echo
+  modem.sendAT("E0");
+  modem.waitResponse();
+
+  // Check SIM status
+  Serial.print("SIM Status: ");
+  SimStatus status = modem.getSimStatus();
+  switch (status) {
+    case SIM_ERROR: Serial.println("SIM ERROR"); break;
+    case SIM_READY: Serial.println("SIM READY"); break;
+    case SIM_LOCKED: Serial.println("SIM LOCKED"); break;
+    default: Serial.println("UNKNOWN"); break;
+  }
+
+  // Check network registration
+  Serial.print("Waiting for network registration...");
+  for (int i = 0; i < 60; i++) {
+    if (modem.waitForNetwork()) {
+      Serial.println(" registered");
+      break;
+    }
+    Serial.print(".");
+    delay(1000);
+    if (i == 59) {
+      Serial.println(" failed");
+      Serial.println("Check antenna and network coverage");
+      return;
+    }
+  }
+
+  // Get network information
+  Serial.print("Network: ");
+  Serial.println(modem.getOperator());
+  Serial.print("Signal quality: ");
+  Serial.println(modem.getSignalQuality());
+
+  // Connect to GPRS
+  Serial.print("Connecting to APN...");
+  if (!modem.gprsConnect(apn, gprsUser, gprsPass)) {
+    Serial.println(" fail");
+    Serial.println("Trying alternative APNs...");
+    
+    const char* altApns[] = {"www", "vinternet", "vinnet"};
+    for (int i = 0; i < 3; i++) {
+      Serial.print("Trying APN: ");
+      Serial.println(altApns[i]);
+      if (modem.gprsConnect(altApns[i], gprsUser, gprsPass)) {
+        Serial.println("Success with alternative APN!");
+        break;
+      }
+      delay(2000);
+    }
+    
+    if (!modem.isGprsConnected()) {
+      Serial.println("All APN attempts failed");
+      return;
+    }
+  } else {
+    Serial.println(" success");
+  }
+
+  // Get IP address
+  Serial.print("Getting IP Address...");
+  String ipAddr;
+  for (int i = 0; i < 5; i++) {
+    ipAddr = modem.getLocalIP();
+    if (ipAddr != "" && ipAddr != "0.0.0.0") {
+      break;
+    }
+    delay(1000);
+  }
+  Serial.println(ipAddr);
+
+  if (modem.isGprsConnected()) {
+    gprsConnected = true;
+    Serial.println("GPRS connection established!");
+  } else {
+    Serial.println("GPRS connection failed");
+    gprsConnected = false;
+  }
+}
+
+void connectMqttWithRetry() {
+  const int MAX_RETRIES = 5;
+  for (int attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    Serial.print("MQTT: Connecting (attempt ");
+    Serial.print(attempt);
+    Serial.print("/");
+    Serial.print(MAX_RETRIES);
+    Serial.println(")...");
+    
+    if (mqtt.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASS)) {
+      Serial.println("MQTT: Connected successfully");
+      mqtt.subscribe(throttle_topic); // Subscribe to throttle topic
+      return;
+    } else {
+      Serial.print("MQTT: Connection failed - state: ");
+      int state = mqtt.state();
+      Serial.print(state);
+      switch (state) {
+        case -4: Serial.println(" (Connection timed out)"); break;
+        case -3: Serial.println(" (Connection lost)"); break;
+        case -2: Serial.println(" (Connect failed)"); break;
+        case -1: Serial.println(" (Disconnected)"); break;
+        case 0: Serial.println(" (Connected)"); break;
+        case 1: Serial.println(" (Bad protocol)"); break;
+        case 2: Serial.println(" (Bad client ID)"); break;
+        case 3: Serial.println(" (Server unavailable)"); break;
+        case 4: Serial.println(" (Bad credentials)"); break;
+        case 5: Serial.println(" (Unauthorized)"); break;
+        default: Serial.println(" (Unknown error)"); break;
+      }
+      if (attempt < MAX_RETRIES) {
+        int delaySec = 5 * (1 << (attempt - 1));
+        Serial.print("MQTT: Retrying in ");
+        Serial.print(delaySec);
+        Serial.println(" seconds...");
+        delay(delaySec * 1000);
+      }
+    }
+  }
+  Serial.println("MQTT: Max retries reached. Resetting system...");
+  ESP.restart();
+}
+
+void loop() {
+  // Maintain GPRS connection
+  if (millis() - lastGprsCheck > 5000) {
+    lastGprsCheck = millis();
+    
+    if (!modem.isGprsConnected()) {
+      gprsConnected = false;
+      Serial.println("GPRS disconnected! Attempting to reconnect...");
+      modem.gprsConnect(apn, gprsUser, gprsPass);
+      
+      if (modem.isGprsConnected()) {
+        gprsConnected = true;
+        Serial.println("Reconnection successful");
+        Serial.print("IP Address: ");
+        Serial.println(modem.getLocalIP());
+      } else {
+        Serial.println("Reconnection failed");
+      }
+    } else {
+      Serial.print("GPRS connected. Signal: ");
+      Serial.println(modem.getSignalQuality());
+    }
+  }
+  
+  // Maintain MQTT connection
+  if (!mqtt.connected()) {
+    connectMqttWithRetry();
+  }
+  mqtt.loop();
+
+  // Read GPS data
+  while (gpsSerial.available()) {
+    char c = gpsSerial.read();
+    gps.encode(c);
+  }
+  
+  // Read MPU6050 data
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+  accelerationX = a.acceleration.x;
+  accelerationY = a.acceleration.y;
+  accelerationZ = a.acceleration.z;
+  gyroX = g.gyro.x;
+  gyroY = g.gyro.y;
+  gyroZ = g.gyro.z;
+  
+  // Read TMP117 temperature
+  sensors_event_t temp_event;
+  tmp117.getEvent(&temp_event);
+  temperature = temp_event.temperature;
+  
+  // Read MAX30102 data
+  long irValue = particleSensor.getIR();
+  long redValue = particleSensor.getRed();
+  
+  // Check if finger is detected
+  if (irValue > 50000) {
+    fingerDetected = true;
+    lastSeen = millis();
+    
+    static int bufferIndex = 0;
+    irBuffer[bufferIndex] = irValue;
+    redBuffer[bufferIndex] = redValue;
+    bufferIndex++;
+    
+    if (bufferIndex == BUFFER_SIZE) {
+      bufferIndex = 0;
+      maxim_heart_rate_and_oxygen_saturation(irBuffer, BUFFER_SIZE, redBuffer, &spo2, &validSPO2, &heartRate, &validHeartRate);
+      
+      if (validHeartRate) {
+        rates[rateSpot++] = (byte)heartRate;
+        rateSpot %= RATE_SIZE;
+        beatAvg = 0;
+        for (byte x = 0; x < RATE_SIZE; x++) {
+          beatAvg += rates[x];
+        }
+        beatAvg /= RATE_SIZE;
+      }
+    }
+    
+    if (checkForBeat(irValue) == true) {
+      long delta = millis() - lastBeat;
+      lastBeat = millis();
+      beatsPerMinute = 60 / (delta / 1000.0);
+      
+      if (beatsPerMinute < 255 && beatsPerMinute > 20) {
+        rates[rateSpot++] = (byte)beatsPerMinute;
+        rateSpot %= RATE_SIZE;
+        beatAvg = 0;
+        for (byte x = 0; x < RATE_SIZE; x++) {
+          beatAvg += rates[x];
+        }
+        beatAvg /= RATE_SIZE;
+      }
+    }
+  } else {
+    if (fingerDetected && (millis() - lastSeen > 1000)) {
+      fingerDetected = false;
+      beatAvg = 0;
+      spo2 = 0;
+      validHeartRate = 0;
+      validSPO2 = 0;
+    }
+  }
+  
+  // Send data periodically
+  if (millis() - lastSend >= TIME_PERIOD) {
+    lastSend = millis();
+    
+    // Temperature
+    Serial.print("Sending Temperature: ");
+    Serial.print(temperature);
+    Serial.println(" °C");
+    if (mqtt.publish(sensor_topic, String(temperature, 2).c_str())) {
+      Serial.println("Temperature publish successful");
+    } else {
+      Serial.println("Temperature publish failed");
+    }
+    
+    // GPS
+    if (gps.location.isValid() && gps.location.age() < 2000) { // Ensure recent fix
+      String gpsCsv = String(gps.location.lat(), 6) + "," + String(gps.location.lng(), 6);
+      String gpsJson = "{\"lat\":" + String(gps.location.lat(), 6) + ",\"lon\":" + String(gps.location.lng(), 6) + "}";
+      Serial.print("GPS Fix Valid - Age: ");
+      Serial.print(gps.location.age());
+      Serial.print("ms, Satellites: ");
+      Serial.println(gps.satellites.value());
+      Serial.print("Sending GPS (CSV): ");
+      Serial.println(gpsCsv);
+      if (mqtt.publish(gps_topic, gpsCsv.c_str())) {
+        Serial.println("GPS CSV publish successful");
+      } else {
+        Serial.println("GPS CSV publish failed");
+      }
+      // Fallback: Send JSON format to same feed
+      if (mqtt.publish(gps_topic, gpsJson.c_str())) {
+        Serial.println("GPS JSON publish successful");
+      } else {
+        Serial.println("GPS JSON publish failed");
+      }
+    } else {
+      Serial.println("No valid GPS fix");
+      Serial.print("Fix Valid: ");
+      Serial.print(gps.location.isValid());
+      Serial.print(", Age: ");
+      Serial.print(gps.location.age());
+      Serial.print("ms, Satellites: ");
+      Serial.println(gps.satellites.value());
+    }
+    
+    // MPU6050
+    String mpuStr = String(accelerationX, 2) + "," + String(accelerationY, 2) + "," + String(accelerationZ, 2) + "," +
+                    String(gyroX, 2) + "," + String(gyroY, 2) + "," + String(gyroZ, 2);
+    Serial.print("Sending MPU6050: ");
+    Serial.println(mpuStr);
+    if (mqtt.publish(mpu6050_topic, mpuStr.c_str())) {
+      Serial.println("MPU6050 publish successful");
+    } else {
+      Serial.println("MPU6050 publish failed");
+    }
+    
+    // MAX30102
+    if (fingerDetected && validHeartRate && validSPO2) {
+      String maxStr = String(heartRate) + "," + String(spo2);
+      Serial.print("Sending MAX30102 - BPM: ");
+      Serial.print(heartRate);
+      Serial.print(", SpO2: ");
+      Serial.print(spo2);
+      Serial.println("%");
+      if (mqtt.publish(max30102_topic, maxStr.c_str())) {
+        Serial.println("MAX30102 publish successful");
+      } else {
+        Serial.println("MAX30102 publish failed");
+      }
+    } else if (fingerDetected) {
+      Serial.println("Calculating MAX30102 data...");
+    } else {
+      Serial.println("No finger detected for MAX30102");
+    }
+  }
+  
+  delay(10);
+}
